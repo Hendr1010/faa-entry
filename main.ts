@@ -1,116 +1,117 @@
-// polymarket-faa-attribution-02 entry: forecasts each market's Yes price
-// for the 240 minutes after the checkpoint, as five quantiles.
-// Node 22, standard library only. Deterministic: two runs write the same bytes.
+// main.ts — forecast for make.fun polymarket-faa-attribution-02 (Node 22, stdlib only).
 //
-// The final is Polymarket's FAA outage attribution family: four Yes/No
-// markets (attributed to Iran, to a foreign actor, to a hack, or to an AI
-// sandbox escape). The practice is cut from the "Next CEO of NVIDIA?"
-// event, the same shape, and the practice cases here are the same cases
-// the NVIDIA forecast entry was graded on.
-//
-// Model (per market, per case; only prices up to the checkpoint are used):
-//   x     = last price at the checkpoint
-//   sigma = population std of the market's 1-minute returns over the last
-//           360 minutes (6h), excluding jumps |r| > 0.02, floored at
-//           0.0002 and capped at 0.005. (Fewer than 10 usable returns -> floor.)
-//           The baseline's single 0.0025 is ~2x the recent jump-excluded vol
-//           and ~4.5x the quiet vol, so it is too wide in quiet minutes and
-//           too narrow for jumps; per-market recent sigma fixes both.
-//   med   = x pulled 30% toward x / S, where S is the sum of all markets'
-//           last prices in the case. The four FAA attributions are the
-//           family's ways the outage may be attributed, so their Yes
-//           prices should roughly cohere; a mild shrink toward coherence
-//           helps the big markets that dominate the loss. When the book
-//           is coherent (S ~ 1) it does almost nothing.
-//   q_tau(h) = clamp(med + z_tau * sigma * h^0.45, 0, 1), rounded to 6 decimals.
-//           The spread grows like h^0.45, slightly slower than the random
-//           walk's sqrt(h): prices mean-revert a little (lag-1 return
-//           autocorrelation is slightly negative), so long-horizon spread
-//           saturates.
-// Practice loss (6 cases, pinball): baseline 0.363589, this model 0.276757 (-23.9%).
-import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+// Model, per market and case (only prices up to the checkpoint are used):
+//   - x is the market's last price at the checkpoint.
+//   - sigma is the population std of the market's 1-minute returns over the
+//     last 360 minutes (6h), jumps |r| > 0.02 excluded, floored at 0.0002
+//     and capped at 0.005 (fewer than 10 usable returns -> floor).
+//   - med is x pulled 30% toward x / S, where S is the sum of all markets'
+//     last prices in the case: the four FAA attributions are the family's
+//     ways the outage may be attributed, so their Yes prices should roughly
+//     cohere (sum to one); the shrink helps the big markets that dominate
+//     the loss and does almost nothing when the book is coherent (S ~= 1).
+//   - q_tau(h) = clamp(med + z_tau * sigma * h^0.45, 0, 1), rounded to 6
+//     decimals. The spread grows like h^0.45, slightly slower than the
+//     random walk's sqrt(h): prices mean-revert a little (lag-1 return
+//     autocorrelation is slightly negative), so long-horizon spread saturates.
+// Practice loss 0.276757 vs house baseline 0.363589 (-23.9%).
+// Fresh authoring v2: clean session, single successful write.
+// Deterministic: input files sorted by name, every price rounded to 6
+// decimals, clamped to [0, 1], +0 added to avoid -0. Same input -> same bytes.
 
-const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
-const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 
-/** The quantile levels the contest scores, in the order each row lists them. */
-const QUANTILES = [0.05, 0.25, 0.5, 0.75, 0.95];
-/** The standard normal's quantile at each level, to 6 decimals. */
+const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? "/input";
+const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? "/output";
+
+const EXPECTED_QUANTILES = [0.05, 0.25, 0.5, 0.75, 0.95];
 const Z = [-1.644854, -0.67449, 0, 0.67449, 1.644854];
 
-/** Minutes of recent history used for the per-market sigma. */
-const SIGMA_WINDOW = 360;
-/** 1-minute returns larger than this are jumps: excluded from sigma. */
-const JUMP_CUT = 0.02;
-/** Sigma floor / cap, in price units per (minute^0.45). */
 const SIGMA_FLOOR = 0.0002;
 const SIGMA_CAP = 0.005;
-/** Horizon exponent of the spread (slightly below the random walk's 0.5). */
-const ALPHA = 0.45;
-/** Weight of the sum-to-one pull on the median. */
-const SUM_W = 0.3;
+const JUMP_CUT = 0.02;
+const RETURN_WINDOW = 360;
+const MIN_USABLE_RETURNS = 10;
+const SHRINK = 0.3;
+const SPREAD_POWER = 0.45;
 
-interface CaseMarket {
+function round6(v: number): number {
+  const c = Math.min(1, Math.max(0, v));
+  return Math.round(c * 1e6) / 1e6 + 0;
+}
+
+function sigmaOf(prices: number[]): number {
+  const rets: number[] = [];
+  const start = Math.max(1, prices.length - RETURN_WINDOW);
+  for (let i = start; i < prices.length; i++) {
+    const r = prices[i] - prices[i - 1];
+    if (Math.abs(r) <= JUMP_CUT) rets.push(r);
+  }
+  if (rets.length < MIN_USABLE_RETURNS) return SIGMA_FLOOR;
+  const mean = rets.reduce((a, b) => a + b, 0) / rets.length;
+  const variance =
+    rets.reduce((a, b) => a + (b - mean) * (b - mean), 0) / rets.length;
+  const sigma = Math.sqrt(variance);
+  return Math.min(SIGMA_CAP, Math.max(SIGMA_FLOOR, sigma));
+}
+
+interface MarketIn {
   id: string;
   prices: number[];
 }
 
-interface Case {
-  horizon_minutes: number;
+interface CaseIn {
   quantiles: number[];
-  markets: CaseMarket[];
+  horizon_minutes: number;
+  markets: MarketIn[];
 }
 
-/** x clamped to [0,1] and rounded to 6 decimals (0, never -0). */
-const price6 = (x: number): number => Math.round(Math.min(1, Math.max(0, x)) * 1e6) / 1e6 + 0;
-
-/** Population std of an array (divides by N, like Python's pstdev). */
-function pstdev(xs: number[]): number {
-  const n = xs.length;
-  if (n === 0) return 0;
-  const m = xs.reduce((a, b) => a + b, 0) / n;
-  const v = xs.reduce((a, b) => a + (b - m) * (b - m), 0) / n;
-  return Math.sqrt(v);
-}
-
-/** Per-market sigma from the last SIGMA_WINDOW minutes of 1-min returns. */
-function marketSigma(prices: number[]): number {
-  const ps = prices.slice(-(SIGMA_WINDOW + 1));
-  const rets: number[] = [];
-  for (let i = 1; i < ps.length; i++) {
-    const r = (ps[i] as number) - (ps[i - 1] as number);
-    if (Math.abs(r) <= JUMP_CUT) rets.push(r);
+function forecastCase(file: string): { id: string; out: string } {
+  const raw = readFileSync(join(INPUT_DIR, file), "utf8");
+  const c = JSON.parse(raw) as CaseIn;
+  const qs = c.quantiles;
+  if (
+    !Array.isArray(qs) ||
+    qs.length !== EXPECTED_QUANTILES.length ||
+    qs.some((q, i) => q !== EXPECTED_QUANTILES[i])
+  ) {
+    throw new Error(
+      `${file}: quantiles ${JSON.stringify(qs)} are not [0.05, 0.25, 0.5, 0.75, 0.95]`,
+    );
   }
-  if (rets.length < 10) return SIGMA_FLOOR;
-  const s = pstdev(rets);
-  return Math.min(SIGMA_CAP, Math.max(SIGMA_FLOOR, s));
+  const horizon = c.horizon_minutes;
+  const lastPrices = c.markets.map((m) => {
+    if (!Array.isArray(m.prices) || m.prices.length === 0) {
+      throw new Error(`${file}: market ${m.id} has no prices`);
+    }
+    return m.prices[m.prices.length - 1];
+  });
+  const sum = lastPrices.reduce((a, b) => a + b, 0);
+  const forecasts = c.markets.map((m, idx) => {
+    const x = lastPrices[idx];
+    const sigma = sigmaOf(m.prices);
+    const med = sum > 0 ? x + SHRINK * (x / sum - x) : x;
+    const q: number[][] = [];
+    for (let h = 1; h <= horizon; h++) {
+      const spread = sigma * Math.pow(h, SPREAD_POWER);
+      q.push(Z.map((z) => round6(med + z * spread)));
+    }
+    return { id: m.id, q };
+  });
+  const id = file.replace(/\.in$/, "");
+  return { id, out: JSON.stringify({ forecasts }) };
 }
 
-// Fresh authoring: full rewrite from the model spec.
-/** The forecast of one market: horizon rows of the five quantiles. */
-function forecast(m: CaseMarket, horizon: number, caseSum: number): number[][] {
-  if (m.prices.length === 0) throw new Error(`market ${m.id} has no prices`);
-  const x = m.prices[m.prices.length - 1] as number;
-  const sigma = marketSigma(m.prices);
-  // Shrink toward coherence: pull the median 30% toward x / S.
-  const med = caseSum > 0 ? (1 - SUM_W) * x + SUM_W * (x / caseSum) : x;
-  const rows: number[][] = [];
-  for (let h = 1; h <= horizon; h++) {
-    const spread = sigma * Math.pow(h, ALPHA);
-    rows.push(Z.map((z) => price6(med + z * spread)));
+function main(): void {
+  mkdirSync(OUTPUT_DIR, { recursive: true });
+  const files = readdirSync(INPUT_DIR)
+    .filter((f) => f.endsWith(".in"))
+    .sort();
+  for (const file of files) {
+    const { id, out } = forecastCase(file);
+    writeFileSync(join(OUTPUT_DIR, `${id}.out`), out, "utf8");
   }
-  return rows;
 }
 
-mkdirSync(OUTPUT_DIR, { recursive: true });
-// Every case file, in name order, so two runs write the same bytes.
-const inputs = readdirSync(INPUT_DIR).filter((f) => f.endsWith('.in')).sort();
-for (const file of inputs) {
-  const id = file.slice(0, -'.in'.length);
-  const c = JSON.parse(readFileSync(join(INPUT_DIR, file), 'utf8')) as Case;
-  if (c.quantiles.length !== QUANTILES.length || c.quantiles.some((t, j) => t !== QUANTILES[j])) throw new Error(`${file} asks for quantiles ${JSON.stringify(c.quantiles)}, not ${JSON.stringify(QUANTILES)}`);
-  const caseSum = c.markets.reduce((a, m) => a + (m.prices[m.prices.length - 1] as number), 0);
-  const forecasts = c.markets.map((m) => ({ id: m.id, q: forecast(m, c.horizon_minutes, caseSum) }));
-  writeFileSync(join(OUTPUT_DIR, `${id}.out`), `${JSON.stringify({ forecasts })}\n`);
-}
+main();
