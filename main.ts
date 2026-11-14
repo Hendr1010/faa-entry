@@ -92,6 +92,7 @@ function forecast(m: CaseMarket, horizon: number, caseSum: number): number[][] {
   if (m.prices.length === 0) throw new Error(`market ${m.id} has no prices`);
   const x = m.prices[m.prices.length - 1] as number;
   const sigma = marketSigma(m.prices);
+  // Shrink toward coherence: pull the median 30% toward x / S.
   const med = caseSum > 0 ? (1 - SUM_W) * x + SUM_W * (x / caseSum) : x;
   const rows: number[][] = [];
   for (let h = 1; h <= horizon; h++) {
