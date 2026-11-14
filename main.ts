@@ -87,6 +87,7 @@ function marketSigma(prices: number[]): number {
   return Math.min(SIGMA_CAP, Math.max(SIGMA_FLOOR, s));
 }
 
+// Fresh authoring: full rewrite from the model spec.
 /** The forecast of one market: horizon rows of the five quantiles. */
 function forecast(m: CaseMarket, horizon: number, caseSum: number): number[][] {
   if (m.prices.length === 0) throw new Error(`market ${m.id} has no prices`);
